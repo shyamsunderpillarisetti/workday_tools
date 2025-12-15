@@ -12,6 +12,14 @@ genai.configure()
 
 CONFIG_PATH = str(Path(__file__).parent.parent / "config.json")
 
+
+def _friendly_rate_limit_message(error: Exception) -> Optional[str]:
+    """Return a user-friendly note when Vertex AI returns a 429/quota error."""
+    err = str(error).lower()
+    if '429' in err or 'resource exhausted' in err or 'quota' in err:
+        return "I’m temporarily out of capacity (429: Resource exhausted). Please retry in a minute."
+    return None
+
 @lru_cache(maxsize=1)
 def _get_cached_workday_data() -> Dict[str, Any]:
     """Cached OAuth result to avoid re-authenticating"""
@@ -246,7 +254,13 @@ TOOL_HANDLERS: Dict[str, callable] = {
 def chat_with_workday(user_message: str) -> str:
     """Send a message to Gemini and get a response"""
     chat = get_chat_session()
-    response = chat.send_message(user_message)
+    try:
+        response = chat.send_message(user_message)
+    except Exception as e:
+        friendly = _friendly_rate_limit_message(e)
+        if friendly:
+            return friendly
+        raise
     
     while response.candidates and response.candidates[0].content.parts:
         function_called = False
@@ -263,14 +277,20 @@ def chat_with_workday(user_message: str) -> str:
                     except Exception as e:
                         result_dict = {"success": False, "error": str(e)}
                     
-                    response = chat.send_message(
-                        genai.protos.Part(
-                            function_response=genai.protos.FunctionResponse(
-                                name=function_name,
-                                response=result_dict
+                    try:
+                        response = chat.send_message(
+                            genai.protos.Part(
+                                function_response=genai.protos.FunctionResponse(
+                                    name=function_name,
+                                    response=result_dict
+                                )
                             )
                         )
-                    )
+                    except Exception as e:
+                        friendly = _friendly_rate_limit_message(e)
+                        if friendly:
+                            return friendly
+                        raise
                     function_called = True
                     break
         
