@@ -5,12 +5,11 @@ from typing import Dict, Any, Optional
 from functools import lru_cache
 import google.generativeai as genai
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 from workday_api import complete_oauth_flow, get_valid_time_off_dates, submit_time_off_request
 
 genai.configure()
 
-CONFIG_PATH = str(Path(__file__).parent.parent / "config.json")
+CONFIG_PATH = str(Path(__file__).parent / "config.json")
 
 
 def _friendly_rate_limit_message(error: Exception) -> Optional[str]:
