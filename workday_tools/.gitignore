@@ -19,5 +19,8 @@ ENV/
 # Config (if contains sensitive data)
 # config.json
 
+# Environment variables (contains API keys)
+.env
+
 # Logs
 *.log
