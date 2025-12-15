@@ -300,53 +300,6 @@
             background: #ffebee;
             color: #c62828;
         }
-
-        .option-buttons {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            margin-top: 16px;
-        }
-
-        .option-btn {
-            padding: 14px 16px;
-            background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            text-align: left;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.2);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .option-btn::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
-            transition: left 0.5s;
-        }
-
-        .option-btn:hover::before {
-            left: 100%;
-        }
-
-        .option-btn:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
-        }
-
-        .option-btn:active {
-            transform: translateY(-1px);
-        }
     </style>
 </head>
 <body>
@@ -388,14 +341,13 @@
             return html;
         }
 
-        function addMessage(text, isUser = false, includeButtons = false) {
+        function addMessage(text, isUser = false) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${isUser ? 'user' : 'bot'}`;
 
             const content = document.createElement('div');
             content.className = 'message-content';
             
-            // Parse markdown for bot messages, plain text for user
             if (isUser) {
                 content.textContent = text;
             } else {
@@ -403,35 +355,6 @@
             }
 
             messageDiv.appendChild(content);
-            
-            // Add option buttons if this is the greeting
-            if (includeButtons && !isUser) {
-                const buttonContainer = document.createElement('div');
-                buttonContainer.className = 'option-buttons';
-                
-                const options = [
-                    { num: '1', text: '📋 Personal information' },
-                    { num: '2', text: '💼 Job details' },
-                    { num: '3', text: '📅 Service dates and tenure' },
-                    { num: '4', text: '🏖️ Leave/absence balances' },
-                    { num: '5', text: '🏢 Organization and location' },
-                    { num: '6', text: '📊 Show all information' }
-                ];
-                
-                options.forEach(opt => {
-                    const btn = document.createElement('button');
-                    btn.className = 'option-btn';
-                    btn.textContent = `${opt.num}. ${opt.text}`;
-                    btn.onclick = () => {
-                        messageInput.value = opt.num;
-                        sendMessage();
-                    };
-                    buttonContainer.appendChild(btn);
-                });
-                
-                content.appendChild(buttonContainer);
-            }
-
             chatBox.appendChild(messageDiv);
             chatBox.scrollTop = chatBox.scrollHeight;
         }
@@ -488,9 +411,7 @@
                 }
 
                 const data = await response.json();
-                // Check if response contains menu options (greeting response)
-                const hasMenu = data.response.includes('1.') && data.response.includes('2.');
-                addMessage(data.response, false, hasMenu);
+                addMessage(data.response, false);
             } catch (error) {
                 const loadingMsg = document.getElementById('loadingMessage');
                 if (loadingMsg) loadingMsg.remove();
@@ -512,9 +433,9 @@
         // Focus input on load
         messageInput.focus();
 
-        // Initial greeting with buttons
-        const greeting = 'Hi! I\'m AskHR, your AI Assistant. 👋\n\nWhat would you like to know? Choose an option below or ask me naturally:';
-        addMessage(greeting, false, true);
+        // Initial greeting
+        addMessage('Hello! I\'m AskHR AI, your professional HR assistant. How may I help you today?', false, false);
+    
     </script>
 </body>
 </html>
