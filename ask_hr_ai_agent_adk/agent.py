@@ -55,7 +55,7 @@ def _get_workday_data() -> Dict[str, Any]:
 
 def reset_auth_cache() -> bool:
     """Clear cached OAuth token and in-memory cache to force re-auth on next call."""
-    global _user_context, _chat_history
+    global _user_context, _chat_history, _submission_complete
     try:
         try:
             _get_cached_workday_data.cache_clear()
@@ -63,6 +63,7 @@ def reset_auth_cache() -> bool:
             pass
         _user_context = None
         _chat_history = []
+        _submission_complete = False
         if os.path.exists(TOKEN_CACHE_PATH):
             os.remove(TOKEN_CACHE_PATH)
             print("✓ Token cache cleared (.token_cache.pkl deleted)")
@@ -290,24 +291,30 @@ CRITICAL - Time-Off Submission Rules (MANDATORY):
    - The user's MOST RECENT message is EXACTLY one of these words: "yes", "confirm", "submit", "go ahead", "proceed"
 
 ⛔ NEVER SUBMIT if the user's message:
-   - Is a new request ("I want to apply for...", "Can I take...", "I need...")
-   - Modifies hours/dates ("only 2 hrs", "make it 4 hours", "actually next week")
-   - Asks questions ("Can I?", "Is it possible?", "Will it work?")
    - Says "not yet", "wait", "hold on", "cancel", "no"
    - Says "thanks", "thank you", "ok", "okay", "sure" (NOT confirmations)
-   - Is anything other than explicit confirmation words
+   - Is anything other than the explicit confirmation words listed above
+
+✅ ACCEPT MODIFICATIONS:
+   - If user wants to change hours ("make it 12", "only 2 hrs"), ACCEPT the change
+   - If user wants different dates ("actually next week"), ACCEPT the change
+   - After any modification: Show UPDATED summary with new values
+   - Then ask for confirmation AGAIN: "Would you like me to proceed with submitting this request?"
+   - Only then submit if they say "yes"/"confirm"/"submit"/"go ahead"/"proceed"
 
 ✅ Required Workflow for EVERY time-off submission:
-   Step 1: Validate dates with check_valid_dates_tool
+   Step 1: Validate dates with check_valid_dates_tool using current hours/dates
    Step 2: Show summary: "I can submit [TYPE] for [DATES] ([HOURS] hours). Would you like me to proceed with submitting this request?"
    Step 3: STOP and WAIT for user response
-   Step 4: IF user says ONLY "yes"/"confirm"/"submit"/"go ahead"/"proceed" → Call submit_time_off_tool
-           IF user says ANYTHING else including "thanks" → DO NOT SUBMIT, just acknowledge
+   Step 4: IF user says explicit confirmation → Call submit_time_off_tool
+           IF user modifies request (change hours/dates) → Accept the change, go back to Step 1 with new values
+           IF user says anything else → DO NOT SUBMIT, just acknowledge and wait
 
-Even for follow-up requests or modifications, you MUST repeat the entire workflow and get fresh confirmation."""
+Never reject user modifications. Always accept modifications, show updated summary, and ask for fresh confirmation."""
 
 _chat_history = []
 _user_context = None
+_submission_complete = False
 
 
 def get_user_context() -> str:
@@ -344,7 +351,7 @@ AVAILABLE TIME-OFF TYPES:
 
 def chat_with_workday(user_message: str) -> str:
     """Send a message to the agent with user context"""
-    global _chat_history
+    global _chat_history, _submission_complete
     
     try:
         context = get_user_context()
@@ -407,6 +414,8 @@ def chat_with_workday(user_message: str) -> str:
                                     tool_args.get('hours_per_day'),
                                     tool_args.get('comment')
                                 )
+                                _submission_complete = True
+                                _chat_history = []
                             else:
                                 result = json.dumps({"error": f"Unknown tool: {tool_name}"})
                             
