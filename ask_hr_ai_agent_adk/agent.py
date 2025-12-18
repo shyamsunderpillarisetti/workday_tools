@@ -3,11 +3,45 @@ import os
 import pickle
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+# Disable SSL verification BEFORE any network imports
+import ssl
+import socket
+
+# Create an unverified SSL context
+_ssl_context = ssl.create_default_context()
+_ssl_context.check_hostname = False
+_ssl_context.verify_mode = ssl.CERT_NONE
+
+# Replace the default HTTPS context creation
+ssl._create_default_https_context = lambda: _ssl_context
+
+# Disable warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Environment variables for SSL bypass
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['SSL_NO_VERIFY'] = '1'
+
+# Patch httpx to disable SSL verification
+import httpx
+from httpx._transports.default import HTTPTransport
+
+original_init = HTTPTransport.__init__
+
+def patched_init(self, *args, **kwargs):
+    kwargs['verify'] = False
+    return original_init(self, *args, **kwargs)
+
+HTTPTransport.__init__ = patched_init
+
+# Now import the google libraries
 from google import genai
 from google.genai import types
 
@@ -16,6 +50,30 @@ from doc_generator import generate_docx_from_template, get_document_from_cache
 
 CONFIG_PATH = str(Path(__file__).parent / "config.json")
 TOKEN_CACHE_PATH = str(Path(__file__).parent / ".token_cache.pkl")
+
+# Load environment variables from local .env file if present
+def _load_env_from_file() -> None:
+    try:
+        dotenv_path = Path(__file__).parent / ".env"
+        if dotenv_path.exists():
+            with open(dotenv_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith('#'):
+                        continue
+                    if '=' in s:
+                        key, val = s.split('=', 1)
+                        key = key.strip()
+                        val = val.strip()
+                        # Remove surrounding quotes if present
+                        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                            val = val[1:-1]
+                        os.environ.setdefault(key, val)
+    except Exception:
+        # Non-fatal; continue without .env
+        pass
+
+_load_env_from_file()
 
 
 @lru_cache(maxsize=1)
@@ -253,6 +311,75 @@ def submit_time_off(time_off_type_id: str, start_date: str, end_date: str,
         return json.dumps({"success": False, "error": str(e)})
 
 
+def _days_in_month(year: int, month: int) -> int:
+    """Return the number of days in a given month/year."""
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    return (next_month - timedelta(days=1)).day
+
+
+def _calculate_tenure(hire_date_str: str, as_of: Optional[date] = None) -> Dict[str, Any]:
+    """Calculate tenure (years, months, days) from hire_date to as_of date."""
+    as_of = as_of or date.today()
+    try:
+        hire_dt = date.fromisoformat(hire_date_str)
+    except Exception as e:
+        raise ValueError(f"Invalid hire date format: {hire_date_str}") from e
+
+    if hire_dt > as_of:
+        raise ValueError("Hire date is in the future")
+
+    years = as_of.year - hire_dt.year
+    months = as_of.month - hire_dt.month
+    days = as_of.day - hire_dt.day
+
+    if days < 0:
+        months -= 1
+        prev_month = as_of.month - 1 or 12
+        prev_year = as_of.year - 1 if as_of.month == 1 else as_of.year
+        days += _days_in_month(prev_year, prev_month)
+
+    if months < 0:
+        years -= 1
+        months += 12
+
+    total_days = (as_of - hire_dt).days
+
+    def _plural(val: int, unit: str) -> str:
+        return f"{val} {unit}" + ("" if val == 1 else "s")
+
+    summary = f"{_plural(years, 'year')}, {_plural(months, 'month')}, {_plural(days, 'day')}"
+
+    return {
+        "hire_date": hire_dt.isoformat(),
+        "as_of_date": as_of.isoformat(),
+        "years": years,
+        "months": months,
+        "days": days,
+        "total_days": total_days,
+        "summary": summary,
+    }
+
+
+def get_tenure() -> str:
+    """Return computed tenure from hire date to today."""
+    data_json = get_workday_id()
+    try:
+        data = json.loads(data_json)
+    except Exception:
+        raise ValueError("Unable to parse Workday data for tenure calculation")
+
+    summary = data.get("summary", {}) if isinstance(data, dict) else {}
+    hire_date_str = summary.get("hire_date")
+    if not hire_date_str:
+        raise ValueError("Hire date not available")
+
+    tenure = _calculate_tenure(hire_date_str, date.today())
+    return json.dumps({"success": True, "tenure": tenure})
+
+
 def get_workday_id_tool() -> str:
     """Get the current user's Workday ID, name, email, title, and organization through OAuth 2.0 authentication"""
     return get_workday_id()
@@ -267,6 +394,11 @@ def submit_time_off_tool(time_off_type_id: str, start_date: str, end_date: str,
                          hours_per_day: float, comment: Optional[str] = None) -> str:
     """Submit a time off request. Only call after user confirms."""
     return submit_time_off(time_off_type_id, start_date, end_date, hours_per_day, comment)
+
+
+def get_tenure_tool() -> str:
+    """Compute precise tenure (years, months, days) from hire date to today."""
+    return get_tenure()
 
 
 def generate_employment_verification_letter_tool() -> str:
@@ -299,6 +431,7 @@ tools = [
     get_workday_id_tool,
     check_valid_dates_tool,
     submit_time_off_tool,
+    get_tenure_tool,
     generate_employment_verification_letter_tool,
 ]
 
@@ -368,7 +501,11 @@ def get_template_context(overrides: Optional[Dict[str, Any]] = None) -> Dict[str
         return overrides or {}
 
 
-client = genai.Client()
+# Configure Google GenAI client with API key
+_api_key = os.getenv("GOOGLE_API_KEY")
+if not _api_key:
+    raise ValueError("GOOGLE_API_KEY is not set. Add it to .env or environment.")
+client = genai.Client(api_key=_api_key)
 
 SYSTEM_INSTRUCTION = """You are AskHR AI, an HR assistant powered by Workday. You have access to the user's HR data and can answer questions about their profile, leave balances, time-off requests, and document generation. Respond naturally and helpfully using the information you have.
 
@@ -383,6 +520,9 @@ DOCUMENT GENERATION:
 - If the user asks for an employment verification letter, use generate_employment_verification_letter_tool() to create it.
 - The tool auto-fills fields from their Workday profile (legal name, job title, manager, etc.) and returns a download link.
 - Always provide the download URL to the user in your response so they can access the letter immediately.
+
+TENURE / LENGTH OF SERVICE:
+- When asked how long the user has worked, call get_tenure_tool to compute exact years, months, and days from hire date to today. Do not guess or estimate manually.
 
 CRITICAL - Time-Off Submission Rules (MANDATORY):
 

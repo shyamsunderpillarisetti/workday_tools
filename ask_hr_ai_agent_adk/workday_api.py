@@ -2,16 +2,26 @@ import json
 import os
 import time
 import urllib.parse
+import ssl
 import requests
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 
+# Disable SSL verification for requests library
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Disable SSL certificate verification globally
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Monkey patch requests to disable SSL verification
+requests.packages.urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.common.exceptions import WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 def load_config(config_path: str) -> Dict[str, str]:
@@ -28,7 +38,13 @@ def load_config(config_path: str) -> Dict[str, str]:
 
 def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str = None, 
                   redirect_uri: str = None, scope: str = None, response_type: str = "code") -> Optional[str]:
-    """Get OAuth authorization code using automated browser."""
+    """Get OAuth authorization code using automated browser (Chrome/Edge).
+
+    Env toggles:
+    - ASKHR_BROWSER: "chrome" (default) or "edge"
+    - ASKHR_HEADLESS: "true" (default) or "false" to show the browser
+    - ASKHR_SELENIUM_TIMEOUT: seconds (default 300)
+    """
     config = {}
     if config_path:
         config = load_config(config_path)
@@ -51,46 +67,99 @@ def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str 
     
     full_auth_url = f"{auth_url}?{urllib.parse.urlencode(params)}"
     
-    chrome_options = Options()
-    chrome_options.add_argument('--ignore-certificate-errors')
-    chrome_options.add_argument('--ignore-ssl-errors')
-    chrome_options.add_argument('--allow-insecure-localhost')
-    chrome_options.add_argument('--disable-web-security')
+    browser_pref = os.getenv('ASKHR_BROWSER', 'chrome').lower()
+    headless = os.getenv('ASKHR_HEADLESS', 'true').lower() in ('1','true','yes')
+    wait_seconds = int(os.getenv('ASKHR_SELENIUM_TIMEOUT', '300'))
+
+    verbose = os.getenv('ASKHR_SELENIUM_DEBUG', 'false').lower() in ('1','true','yes')
+
+    def _apply_common_opts(opts):
+        opts.add_argument('--ignore-certificate-errors')
+        opts.add_argument('--ignore-ssl-errors')
+        opts.add_argument('--allow-insecure-localhost')
+        opts.add_argument('--disable-web-security')
+        opts.add_argument('--disable-features=IsolateOrigins,site-per-process')
+        opts.add_argument('--disable-gpu')
+        opts.add_argument('--no-sandbox')
+        opts.add_argument('--window-size=1400,900')
+        opts.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        if headless:
+            opts.add_argument('--headless=new')
+        return opts
     
     driver = None
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        
+        driver = None
+        launch_errors = []
+
+        # Try preferred browser first, then fallback
+        for choice in ([browser_pref] if browser_pref in ('chrome','edge') else ['chrome','edge']):
+            try:
+                if choice == 'edge':
+                    edge_opts = _apply_common_opts(EdgeOptions())
+                    driver = webdriver.Edge(options=edge_opts)
+                else:
+                    chrome_opts = _apply_common_opts(ChromeOptions())
+                    driver = webdriver.Chrome(options=chrome_opts)
+                break
+            except Exception as e:
+                launch_errors.append(f"{choice}: {e}")
+                driver = None
+                continue
+
+        if driver is None:
+            raise RuntimeError(f"Failed to start browser. Errors: {launch_errors}")
+
         driver.get(full_auth_url)
-        
-        max_wait_time = 300
+
+        max_wait_time = wait_seconds
         start_time = time.time()
-        
+        last_url = None
+
+        log_every = 5
+        next_log = time.time() + log_every
+
         while time.time() - start_time < max_wait_time:
-            current_url = driver.current_url
-            
-            if redirect_uri.split('?')[0] in current_url or 'localhost' in current_url:
+            try:
+                current_url = driver.current_url
+                last_url = current_url
+            except Exception as e:
+                if verbose:
+                    print(f"[Workday][Selenium] current_url error: {e}")
+                time.sleep(0.5)
+                continue
+
+            redirect_base = redirect_uri.split('?')[0] if redirect_uri else ''
+
+            if (redirect_base and redirect_base in current_url) or 'localhost' in current_url:
                 parsed_url = urlparse(current_url)
                 query_params = parse_qs(parsed_url.query)
-                
+
                 if parsed_url.fragment:
                     fragment_params = parse_qs(parsed_url.fragment)
                     query_params.update(fragment_params)
-                
+
                 if 'code' in query_params:
                     auth_code = query_params['code'][0]
+                    if verbose:
+                        print(f"[Workday][Selenium] Auth code captured")
                     return auth_code
                 elif 'error' in query_params:
                     error = query_params['error'][0]
                     raise ValueError(f"Authorization error: {error}")
-            
+
             time.sleep(0.5)
+
+            if verbose and time.time() >= next_log:
+                print(f"[Workday][Selenium] Still waiting; current_url={current_url}")
+                next_log = time.time() + log_every
+
+        raise TimeoutError(f"Authorization not completed within {max_wait_time} seconds. Last URL: {last_url}")
         
         raise TimeoutError("Authorization not completed within 5 minutes")
         
     except WebDriverException as e:
-        raise WebDriverException(f"Browser error: {e}. Make sure Chrome is installed.") from e
+        raise WebDriverException(f"Browser error: {e}. Ensure Chrome or Edge is installed.") from e
     except (ValueError, TimeoutError):
         raise
     except Exception as e:
@@ -98,6 +167,7 @@ def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str 
     finally:
         if driver:
             driver.quit()
+
 
 
 def get_access_token(config_path: str = None, code: str = None, token_url: str = None, 
@@ -135,13 +205,11 @@ def get_access_token(config_path: str = None, code: str = None, token_url: str =
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
     try:
-        response = requests.post(token_url, data=data, headers=headers, timeout=30)
-        
+        response = requests.post(token_url, data=data, headers=headers, timeout=30, verify=False)
         if response.status_code == 200:
             return response.json()
         else:
             raise ValueError(f"Token request failed with status {response.status_code}: {response.text}")
-            
     except requests.exceptions.Timeout as e:
         raise TimeoutError(f"Token request timed out: {e}") from e
     except requests.exceptions.RequestException as e:
@@ -171,7 +239,7 @@ def get_workday_data_merged(base_url: str, tenant: str, access_token: str,
     
     for url in endpoints:
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = requests.get(url, headers=headers, timeout=30, verify=False)
             if response.status_code == 200:
                 merged_data.update(response.json())
             else:
@@ -188,12 +256,15 @@ def get_workday_data_merged(base_url: str, tenant: str, access_token: str,
     return merged_data
 
 
+
 def complete_oauth_flow(config_path: str) -> Dict[str, Any]:
     """Complete OAuth flow."""
     config = load_config(config_path)
-    
+    print("[Workday] Starting OAuth flow...")
     auth_code = get_auth_code(config_path=config_path)
+    print("[Workday] Auth code obtained")
     token_data = get_access_token(config_path=config_path, code=auth_code)
+    print("[Workday] Access token retrieved")
     access_token = token_data['access_token']
     
     base_url = config.get('base_url')
@@ -215,6 +286,7 @@ def complete_oauth_flow(config_path: str) -> Dict[str, Any]:
         f"{base_url}/api/person/v4/{tenant}/people/me/legalName",
     ]
 
+    print("[Workday] Fetching primary user endpoints...")
     user_data = get_workday_data_merged(base_url, tenant, access_token, primary_endpoints)
     
     headers = {
@@ -223,20 +295,21 @@ def complete_oauth_flow(config_path: str) -> Dict[str, Any]:
     }
     
     try:
-        legal_name_response = requests.get(f"{base_url}/api/person/v4/{tenant}/people/me/legalName", headers=headers, timeout=30)
+        legal_name_response = requests.get(f"{base_url}/api/person/v4/{tenant}/people/me/legalName", headers=headers, timeout=30, verify=False)
         if legal_name_response.status_code == 200:
             user_data['legalName'] = legal_name_response.json()
     except Exception:
         pass
     
     try:
-        service_dates_response = requests.get(f"{base_url}/api/staffing/v7/{tenant}/workers/me/serviceDates", headers=headers, timeout=30)
+        service_dates_response = requests.get(f"{base_url}/api/staffing/v7/{tenant}/workers/me/serviceDates", headers=headers, timeout=30, verify=False)
         if service_dates_response.status_code == 200:
             user_data['serviceDates'] = service_dates_response.json()
     except Exception:
         pass
     
     workday_id = extract_workday_id(user_data)
+    print(f"[Workday] Workday ID: {workday_id}")
     
     if workday_id:
         absence_endpoints = [
@@ -324,7 +397,7 @@ def submit_time_off_request(base_url: str, tenant: str, access_token: str, workd
     }
     
     try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=30)
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=30, verify=False)
         
         if response.status_code in [200, 201]:
             return {

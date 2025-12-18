@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, render_template, send_file
 from typing import Dict, Any, Tuple
 import traceback
 import os
-from agent import chat_with_workday, reset_auth_cache
+from agent import chat_with_workday, reset_auth_cache, get_workday_id
 from doc_generator import get_document_from_cache, get_document_filename_from_cache
 
 app = Flask(__name__)
@@ -39,6 +39,16 @@ def chat() -> Tuple[Dict[str, Any], int]:
     except Exception as e:
         print(f"Unexpected error: {traceback.format_exc()}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route('/diagnostics', methods=['GET'])
+def diagnostics() -> Tuple[Dict[str, Any], int]:
+    """Return diagnostic info about Workday auth and user data."""
+    try:
+        data_json = get_workday_id()
+        return jsonify({'data': data_json}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.errorhandler(404)
