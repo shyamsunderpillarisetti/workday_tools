@@ -3,7 +3,11 @@ from typing import Dict, Any, Tuple
 import traceback
 import os
 from agent import chat_with_workday, reset_auth_cache, get_workday_id
-from doc_generator import get_document_from_cache, get_document_filename_from_cache
+from doc_generator import (
+    get_document_from_cache,
+    get_document_filename_from_cache,
+    get_document_mimetype_from_cache,
+)
 
 app = Flask(__name__)
 
@@ -80,13 +84,14 @@ def download_doc_from_memory(doc_key: str):
         return jsonify({'error': 'Document not found or expired'}), 404
     
     filename = get_document_filename_from_cache(doc_key) or "document.docx"
+    mimetype = get_document_mimetype_from_cache(doc_key)
     
     # Reset BytesIO position to beginning
     doc_bytes.seek(0)
     
     return send_file(
         doc_bytes,
-        mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        mimetype=mimetype,
         as_attachment=True,
         download_name=filename
     )

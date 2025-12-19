@@ -46,10 +46,15 @@ from google import genai
 from google.genai import types
 
 from workday_api import complete_oauth_flow, get_valid_time_off_dates, submit_time_off_request
-from doc_generator import generate_docx_from_template, get_document_from_cache
+from doc_generator import (
+    generate_docx_from_template,
+    generate_docx_from_template_as_pdf,
+    get_document_from_cache,
+)
 
 CONFIG_PATH = str(Path(__file__).parent / "config.json")
 TOKEN_CACHE_PATH = str(Path(__file__).parent / ".token_cache.pkl")
+EVL_SENT_FLAG_PATH = Path(__file__).parent / ".evl_sent.flag"
 
 # Load environment variables from local .env file if present
 def _load_env_from_file() -> None:
@@ -114,7 +119,7 @@ def _get_workday_data() -> Dict[str, Any]:
 
 def reset_auth_cache() -> bool:
     """Clear cached OAuth token and in-memory cache to force re-auth on next call."""
-    global _user_context, _chat_history, _submission_complete
+    global _user_context, _chat_history, _submission_complete, _evl_sent_to_hr
     try:
         try:
             _get_cached_workday_data.cache_clear()
@@ -123,15 +128,22 @@ def reset_auth_cache() -> bool:
         _user_context = None
         _chat_history = []
         _submission_complete = False
+        _evl_sent_to_hr = False
         if os.path.exists(TOKEN_CACHE_PATH):
             os.remove(TOKEN_CACHE_PATH)
-            print("✓ Token cache cleared (.token_cache.pkl deleted)")
+            print('[OK] Token cache cleared (.token_cache.pkl deleted)')
         else:
-            print("✓ No token cache found (already clear)")
-        print("✓ Session state reset (context + history cleared)")
+            print('[OK] No token cache found (already clear)')
+        if EVL_SENT_FLAG_PATH.exists():
+            try:
+                EVL_SENT_FLAG_PATH.unlink()
+                print('[OK] EVL sent flag cleared')
+            except Exception:
+                pass
+        print('[OK] Session state reset (context + history cleared)')
         return True
     except Exception as e:
-        print(f"✗ Failed to reset auth cache: {e}")
+        print(f'[ERROR] Failed to reset auth cache: {e}')
         return False
 
 
@@ -404,10 +416,13 @@ def get_tenure_tool() -> str:
 def generate_employment_verification_letter_tool() -> str:
     """Generate an employment verification letter for the current user using the template and auto-filled context."""
     try:
+        global _evl_sent_to_hr
+        if _evl_sent_to_hr or EVL_SENT_FLAG_PATH.exists():
+            return json.dumps({"success": False, "error": "An employment verification letter has already been emailed to HR."})
         context = get_template_context()
         # Use legal_name if available, otherwise fall back to employee_name, then 'Employee'
         legal_name = context.get('legal_name') or context.get('employee_name') or 'Employee'
-        result = generate_docx_from_template(
+        result = generate_docx_from_template_as_pdf(
             template_name="evl_template.docx",
             context=context,
             filename=f"Employment Verification Letter - {legal_name}.docx"
@@ -415,7 +430,12 @@ def generate_employment_verification_letter_tool() -> str:
         filename = result.get("filename")
         doc_key = result.get("download_key")
         download_url = f"/download_doc/{doc_key}"
-        message = f"Your employment verification letter has been generated. **[Download here]({download_url})** - opens in a new tab."
+        message = f"Your employment verification letter has been generated. [Download here]({download_url})"
+        _evl_sent_to_hr = True
+        try:
+            EVL_SENT_FLAG_PATH.write_text(str(int(time.time())), encoding="utf-8")
+        except Exception:
+            pass
         return json.dumps({
             "success": True,
             "filename": filename,
@@ -450,6 +470,10 @@ def get_template_context(overrides: Optional[Dict[str, Any]] = None) -> Dict[str
         raw_legal = raw.get('legal_name', {}) if isinstance(raw, dict) else {}
         from datetime import date
         today_str = date.today().strftime("%B %d, %Y")
+        signature_image = os.getenv("HR_SIGNATURE_IMAGE", "hr_signature.png")
+        signature_width_mm = os.getenv("HR_SIGNATURE_WIDTH_MM", "40")
+        header_image = os.getenv("HR_HEADER_IMAGE", "evl_header.png")
+        header_width_mm = os.getenv("HR_HEADER_WIDTH_MM", "170")
         ctx = {
             "employee_name": summary.get("name"),
             "legal_name": summary.get("legal_name"),
@@ -462,6 +486,18 @@ def get_template_context(overrides: Optional[Dict[str, Any]] = None) -> Dict[str
             "workday_id": summary.get("workday_id"),
             "today_date": today_str,
             "Today_Date": today_str,
+            # Signature placeholders
+            "hr_signature": os.getenv("HR_SIGNATURE_TEXT", "______________________________"),
+            "hr_signature_block": os.getenv(
+                "HR_SIGNATURE_BLOCK",
+                f"{os.getenv('HR_SIGNATURE_TEXT', '______________________________')}\nHR Representative\nDate: __________",
+            ),
+            "hr_signature_image": signature_image,
+            "hr_signature_width_mm": signature_width_mm,
+            # Header placeholders
+            "hr_header_image": header_image,
+            "hr_header_width_mm": header_width_mm,
+            "Header": header_image,
         }
         # auto-generate common alias variations (Title_Snake and PascalCase)
         def add_alias_variants(key: str):
@@ -475,7 +511,9 @@ def get_template_context(overrides: Optional[Dict[str, Any]] = None) -> Dict[str
             ctx[pascal] = val
         for base_key in [
             "employee_name","legal_name","email","job_title","manager",
-            "location","hire_date","worker_type","workday_id","today_date"
+            "location","hire_date","worker_type","workday_id","today_date",
+            "hr_signature","hr_signature_block","hr_signature_image","hr_signature_width_mm",
+            "hr_header_image","hr_header_width_mm","Header"
         ]:
             add_alias_variants(base_key)
         # common alias mappings for template variables
@@ -556,6 +594,7 @@ Never reject user modifications. Always accept modifications, show updated summa
 _chat_history = []
 _user_context = None
 _submission_complete = False
+_evl_sent_to_hr = EVL_SENT_FLAG_PATH.exists()
 
 
 def get_user_context() -> str:
@@ -592,9 +631,62 @@ AVAILABLE TIME-OFF TYPES:
 
 def chat_with_workday(user_message: str) -> str:
     """Send a message to the agent with user context"""
-    global _chat_history, _submission_complete
+    global _chat_history, _submission_complete, _evl_sent_to_hr
     
     try:
+        # Fast-path EVL requests to guarantee a download link instead of relying on the model
+        def _maybe_handle_evl(msg: str) -> Optional[str]:
+            global _evl_sent_to_hr
+            text = (msg or "").lower()
+            triggers = [
+                "employment verification",
+                "verification letter",
+                "employment letter",
+                "evl",
+                "proof of employment",
+            ]
+            if not any(t in text for t in triggers):
+                return None
+            if _evl_sent_to_hr or EVL_SENT_FLAG_PATH.exists():
+                return "An employment verification letter has already been emailed to HR."
+            try:
+                raw = generate_employment_verification_letter_tool()
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                if data.get("success"):
+                    download_url = data.get("download_url")
+                    filename = data.get("filename")
+                    msg_text = data.get("message") or "Your employment verification letter has been generated."
+                    if download_url:
+                        # If the tool message already includes the URL, return it as-is to avoid duplication
+                        if download_url in msg_text:
+                            _evl_sent_to_hr = True
+                            try:
+                                EVL_SENT_FLAG_PATH.write_text(str(int(time.time())), encoding="utf-8")
+                            except Exception:
+                                pass
+                            return msg_text
+                        link_text = f"[here]({download_url})"
+                        suffix = f" ({filename})" if filename else ""
+                        _evl_sent_to_hr = True
+                        try:
+                            EVL_SENT_FLAG_PATH.write_text(str(int(time.time())), encoding="utf-8")
+                        except Exception:
+                            pass
+                        return f"Your employment verification letter has been generated. Download {link_text}{suffix}"
+                    _evl_sent_to_hr = True
+                    try:
+                        EVL_SENT_FLAG_PATH.write_text(str(int(time.time())), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return msg_text or "Your employment verification letter has been generated."
+                return data.get("error") or "Unable to generate the employment verification letter."
+            except Exception as e:
+                return f"Unable to generate the employment verification letter: {e}"
+
+        evl_response = _maybe_handle_evl(user_message)
+        if evl_response:
+            return evl_response
+
         # Reset chat history if previous submission completed
         if _submission_complete:
             _chat_history = []
