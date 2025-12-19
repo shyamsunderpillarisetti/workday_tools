@@ -1,6 +1,5 @@
 import json
 import os
-import pickle
 import re
 import time
 from datetime import date, timedelta
@@ -8,40 +7,31 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-# Disable SSL verification BEFORE any network imports
-import ssl
-import socket
+# Optional TLS verification bypass (opt-in; prefer setting CA bundle instead)
+if os.getenv("ASKHR_DISABLE_SSL_VERIFY", "false").lower() in ("1", "true", "yes"):
+    import ssl
+    import urllib3
+    import httpx
+    from httpx._transports.default import HTTPTransport
 
-# Create an unverified SSL context
-_ssl_context = ssl.create_default_context()
-_ssl_context.check_hostname = False
-_ssl_context.verify_mode = ssl.CERT_NONE
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+    ssl._create_default_https_context = lambda: _ssl_ctx  # type: ignore
 
-# Replace the default HTTPS context creation
-ssl._create_default_https_context = lambda: _ssl_context
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    os.environ["REQUESTS_CA_BUNDLE"] = ""
+    os.environ["CURL_CA_BUNDLE"] = ""
+    os.environ["SSL_NO_VERIFY"] = "1"
 
-# Disable warnings
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _orig_httpx_init = HTTPTransport.__init__
 
-# Environment variables for SSL bypass
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['SSL_NO_VERIFY'] = '1'
+    def _patched_httpx_init(self, *args, **kwargs):
+        kwargs["verify"] = False
+        return _orig_httpx_init(self, *args, **kwargs)
 
-# Patch httpx to disable SSL verification
-import httpx
-from httpx._transports.default import HTTPTransport
+    HTTPTransport.__init__ = _patched_httpx_init  # type: ignore
 
-original_init = HTTPTransport.__init__
-
-def patched_init(self, *args, **kwargs):
-    kwargs['verify'] = False
-    return original_init(self, *args, **kwargs)
-
-HTTPTransport.__init__ = patched_init
-
-# Now import the google libraries
 from google import genai
 from google.genai import types
 
@@ -53,7 +43,8 @@ from doc_generator import (
 )
 
 CONFIG_PATH = str(Path(__file__).parent / "config.json")
-TOKEN_CACHE_PATH = str(Path(__file__).parent / ".token_cache.pkl")
+TOKEN_CACHE_PATH = Path(__file__).parent / ".token_cache.json"
+LEGACY_TOKEN_CACHE_PATH = Path(__file__).parent / ".token_cache.pkl"
 EVL_SENT_FLAG_PATH = Path(__file__).parent / ".evl_sent.flag"
 
 # Load environment variables from local .env file if present
@@ -85,22 +76,22 @@ _load_env_from_file()
 def _get_cached_workday_data() -> Dict[str, Any]:
     """Get cached workday data with OAuth token expiration checking."""
     try:
-        if os.path.exists(TOKEN_CACHE_PATH):
-            with open(TOKEN_CACHE_PATH, 'rb') as f:
-                cached_data = pickle.load(f)
-                token_timestamp = cached_data.get('_token_timestamp', 0)
-                token_expires_in = cached_data.get('_token_expires_in', 3600)
-                if (time.time() - token_timestamp) < (token_expires_in - 120):
-                    return cached_data
+        if TOKEN_CACHE_PATH.exists():
+            with open(TOKEN_CACHE_PATH, 'r', encoding='utf-8') as f:
+                cached_data = json.load(f)
+            token_timestamp = cached_data.get('_token_timestamp', 0)
+            token_expires_in = cached_data.get('_token_expires_in', 3600)
+            if (time.time() - token_timestamp) < (token_expires_in - 120):
+                return cached_data
     except Exception:
         pass
-    
+
     try:
         result = complete_oauth_flow(config_path=CONFIG_PATH)
         result['_token_timestamp'] = time.time()
         result['_token_expires_in'] = result.get('_token_expires_in', 3600)
-        with open(TOKEN_CACHE_PATH, 'wb') as f:
-            pickle.dump(result, f)
+        with open(TOKEN_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(result, f)
         return result
     except Exception as e:
         _get_cached_workday_data.cache_clear()
@@ -129,9 +120,12 @@ def reset_auth_cache() -> bool:
         _chat_history = []
         _submission_complete = False
         _evl_sent_to_hr = False
-        if os.path.exists(TOKEN_CACHE_PATH):
-            os.remove(TOKEN_CACHE_PATH)
-            print('[OK] Token cache cleared (.token_cache.pkl deleted)')
+        if TOKEN_CACHE_PATH.exists():
+            TOKEN_CACHE_PATH.unlink()
+            print('[OK] Token cache cleared (.token_cache.json deleted)')
+        elif LEGACY_TOKEN_CACHE_PATH.exists():
+            LEGACY_TOKEN_CACHE_PATH.unlink()
+            print('[OK] Legacy token cache cleared (.token_cache.pkl deleted)')
         else:
             print('[OK] No token cache found (already clear)')
         if EVL_SENT_FLAG_PATH.exists():

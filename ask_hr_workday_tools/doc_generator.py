@@ -132,7 +132,7 @@ def generate_docx_from_template(template_name: str, context: Dict[str, Any], fil
         filename: Optional output filename
 
     Returns:
-        Dict with keys: success, filename, download_key (for Flask route)
+        Dict with keys: success, filename, download_key (for download route)
     """
     if not _HAS_DOXCTPL:
         raise RuntimeError("docxtpl is not installed. Please install 'docxtpl'.")

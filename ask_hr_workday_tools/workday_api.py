@@ -2,21 +2,10 @@ import json
 import os
 import time
 import urllib.parse
-import ssl
 import requests
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
-
-# Disable SSL verification for requests library
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Disable SSL certificate verification globally
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# Monkey patch requests to disable SSL verification
-requests.packages.urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -25,15 +14,37 @@ from selenium.common.exceptions import WebDriverException
 
 
 def load_config(config_path: str) -> Dict[str, str]:
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    try:
-        with open(config_path, 'r') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in config file: {e}") from e
-    except IOError as e:
-        raise IOError(f"Error reading config file: {e}") from e
+    """Load Workday config, allowing env vars to override file values."""
+    config: Dict[str, str] = {}
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in config file: {e}") from e
+        except IOError as e:
+            raise IOError(f"Error reading config file: {e}") from e
+
+    # Overlay environment variables (prefer WORKDAY_* prefix, then bare)
+    keys = [
+        "auth_url",
+        "token_url",
+        "base_url",
+        "tenant",
+        "client_id",
+        "client_secret",
+        "redirect_uri",
+        "response_type",
+        "grant_type",
+        "scope",
+    ]
+    for key in keys:
+        env_val = os.getenv(f"WORKDAY_{key.upper()}") or os.getenv(key.upper())
+        if env_val:
+            config[key] = env_val
+
+    return config
 
 
 def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str = None, 
@@ -53,7 +64,7 @@ def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str 
     client_id = client_id or config.get('client_id')
     redirect_uri = redirect_uri or config.get('redirect_uri')
     scope = scope or config.get('scope')
-    response_type = response_type or config.get('response_type', 'code')
+    response_type = response_type or config.get('response_type') or 'code'
     
     if not all([auth_url, client_id, redirect_uri, scope]):
         raise ValueError("Missing required parameters: auth_url, client_id, redirect_uri, scope")
@@ -182,7 +193,7 @@ def get_access_token(config_path: str = None, code: str = None, token_url: str =
         raise ValueError("Authorization code is required")
     
     token_url = token_url or config.get('token_url')
-    grant_type = grant_type or config.get('grant_type', 'authorization_code')
+    grant_type = grant_type or config.get('grant_type') or 'authorization_code'
     client_id = client_id or config.get('client_id')
     client_secret = client_secret or config.get('client_secret')
     redirect_uri = redirect_uri or config.get('redirect_uri')
@@ -205,7 +216,7 @@ def get_access_token(config_path: str = None, code: str = None, token_url: str =
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
     try:
-        response = requests.post(token_url, data=data, headers=headers, timeout=30, verify=False)
+        response = requests.post(token_url, data=data, headers=headers, timeout=30)
         if response.status_code == 200:
             return response.json()
         else:
@@ -239,7 +250,7 @@ def get_workday_data_merged(base_url: str, tenant: str, access_token: str,
     
     for url in endpoints:
         try:
-            response = requests.get(url, headers=headers, timeout=30, verify=False)
+            response = requests.get(url, headers=headers, timeout=30)
             if response.status_code == 200:
                 merged_data.update(response.json())
             else:
@@ -295,14 +306,14 @@ def complete_oauth_flow(config_path: str) -> Dict[str, Any]:
     }
     
     try:
-        legal_name_response = requests.get(f"{base_url}/api/person/v4/{tenant}/people/me/legalName", headers=headers, timeout=30, verify=False)
+        legal_name_response = requests.get(f"{base_url}/api/person/v4/{tenant}/people/me/legalName", headers=headers, timeout=30)
         if legal_name_response.status_code == 200:
             user_data['legalName'] = legal_name_response.json()
     except Exception:
         pass
     
     try:
-        service_dates_response = requests.get(f"{base_url}/api/staffing/v7/{tenant}/workers/me/serviceDates", headers=headers, timeout=30, verify=False)
+        service_dates_response = requests.get(f"{base_url}/api/staffing/v7/{tenant}/workers/me/serviceDates", headers=headers, timeout=30)
         if service_dates_response.status_code == 200:
             user_data['serviceDates'] = service_dates_response.json()
     except Exception:
@@ -397,7 +408,7 @@ def submit_time_off_request(base_url: str, tenant: str, access_token: str, workd
     }
     
     try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=30, verify=False)
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=30)
         
         if response.status_code in [200, 201]:
             return {

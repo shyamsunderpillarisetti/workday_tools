@@ -14,6 +14,7 @@ ENV/
 
 # Token cache
 .token_cache.pkl
+.token_cache.json
 workday_data_dump.json
 
 # Logs
