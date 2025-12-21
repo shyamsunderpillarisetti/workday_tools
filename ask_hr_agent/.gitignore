@@ -16,6 +16,7 @@ ENV/
 .token_cache.pkl
 .token_cache.json
 workday_data_dump.json
+.evl_sent.flag
 
 # Logs
 *.log
