@@ -25,4 +25,12 @@ if (Test-Path $edgeDriver) {
 
 Write-Host "Starting AskHR Workday tools server with TLS bypass enabled on port $Port (browser=$Browser, headless=$($Headless.IsPresent))"
 
-& "$repoRoot\.venv\Scripts\python.exe" -m uvicorn workday_tools_agent.server:app --host 127.0.0.1 --port $Port
+$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    $venvPython = Join-Path $root ".venv\Scripts\python.exe"
+}
+if (-not (Test-Path $venvPython)) {
+    throw "Python venv not found. Expected at '$repoRoot\.venv\Scripts\python.exe' or '$root\.venv\Scripts\python.exe'."
+}
+
+& $venvPython -m uvicorn workday_tools_agent.server:app --host 127.0.0.1 --port $Port
