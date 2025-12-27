@@ -11,10 +11,12 @@ ENV/
 
 # Environment variables
 .env
+.env.*
 
 # Token cache
 .token_cache.pkl
 .token_cache.json
+.token_cache.*
 workday_data_dump.json
 .evl_sent.flag
 

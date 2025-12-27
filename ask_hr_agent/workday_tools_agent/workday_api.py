@@ -3,6 +3,7 @@ import os
 import time
 import urllib.parse
 import requests
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
@@ -10,6 +11,8 @@ from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.common.exceptions import WebDriverException
 
 
@@ -82,6 +85,14 @@ def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str 
     headless = os.getenv('ASKHR_HEADLESS', 'true').lower() in ('1','true','yes')
     wait_seconds = int(os.getenv('ASKHR_SELENIUM_TIMEOUT', '300'))
 
+    # If running non-headless, ensure UI pops to foreground
+    if not headless:
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(ctypes.c_int(-1))
+        except Exception:
+            pass
+
     verbose = os.getenv('ASKHR_SELENIUM_DEBUG', 'false').lower() in ('1','true','yes')
 
     def _apply_common_opts(opts):
@@ -103,15 +114,41 @@ def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str 
         driver = None
         launch_errors = []
 
+        drivers_dir = Path(__file__).resolve().parent / "drivers"
+
         # Try preferred browser first, then fallback
         for choice in ([browser_pref] if browser_pref in ('chrome','edge') else ['chrome','edge']):
             try:
+                driver_path = None
+                if choice == 'edge':
+                    driver_path = os.getenv('ASKHR_EDGEDRIVER_PATH')
+                    if not driver_path:
+                        local_driver = drivers_dir / "msedgedriver.exe"
+                        if local_driver.exists():
+                            driver_path = str(local_driver)
+                else:
+                    driver_path = os.getenv('ASKHR_CHROMEDRIVER_PATH')
+                    if not driver_path:
+                        local_driver = drivers_dir / "chromedriver.exe"
+                        if local_driver.exists():
+                            driver_path = str(local_driver)
+
                 if choice == 'edge':
                     edge_opts = _apply_common_opts(EdgeOptions())
-                    driver = webdriver.Edge(options=edge_opts)
+                    if driver_path:
+                        if verbose:
+                            print(f"[Workday][Selenium] Using EdgeDriver: {driver_path}")
+                        driver = webdriver.Edge(service=EdgeService(executable_path=driver_path), options=edge_opts)
+                    else:
+                        driver = webdriver.Edge(options=edge_opts)
                 else:
                     chrome_opts = _apply_common_opts(ChromeOptions())
-                    driver = webdriver.Chrome(options=chrome_opts)
+                    if driver_path:
+                        if verbose:
+                            print(f"[Workday][Selenium] Using ChromeDriver: {driver_path}")
+                        driver = webdriver.Chrome(service=ChromeService(executable_path=driver_path), options=chrome_opts)
+                    else:
+                        driver = webdriver.Chrome(options=chrome_opts)
                 break
             except Exception as e:
                 launch_errors.append(f"{choice}: {e}")
@@ -121,6 +158,8 @@ def get_auth_code(config_path: str = None, auth_url: str = None, client_id: str 
         if driver is None:
             raise RuntimeError(f"Failed to start browser. Errors: {launch_errors}")
 
+        if verbose:
+            print(f"[Workday][Selenium] Launching auth URL: {full_auth_url}")
         driver.get(full_auth_url)
 
         max_wait_time = wait_seconds
@@ -237,8 +276,7 @@ def extract_workday_id(user_data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def get_workday_data_merged(base_url: str, tenant: str, access_token: str, 
-                           endpoints: List[str]) -> Dict[str, Any]:
+def get_workday_data_merged(access_token: str, endpoints: List[str]) -> Dict[str, Any]:
     """Fetch data from multiple endpoints and merge."""
     headers = {
         'Authorization': f'Bearer {access_token}',
@@ -298,7 +336,17 @@ def complete_oauth_flow(config_path: str) -> Dict[str, Any]:
     ]
 
     print("[Workday] Fetching primary user endpoints...")
-    user_data = get_workday_data_merged(base_url, tenant, access_token, primary_endpoints)
+    user_data = None
+    for attempt in range(2):
+        try:
+            user_data = get_workday_data_merged(access_token, primary_endpoints)
+            break
+        except ValueError as e:
+            if attempt == 0:
+                print(f"[Workday] Primary endpoints failed, retrying once: {e}")
+                time.sleep(2)
+                continue
+            raise
     
     headers = {
         'Authorization': f'Bearer {access_token}',
@@ -327,14 +375,14 @@ def complete_oauth_flow(config_path: str) -> Dict[str, Any]:
             f"{base_url}/api/absenceManagement/v3/{tenant}/balances?worker={workday_id}",
         ]
         try:
-            absence_data = get_workday_data_merged(base_url, tenant, access_token, absence_endpoints)
+            absence_data = get_workday_data_merged(access_token, absence_endpoints)
             user_data['absence_balances'] = absence_data
         except ValueError:
             pass
 
         eligible_types_endpoint = f"{base_url}/api/absenceManagement/v3/{tenant}/workers/{workday_id}/eligibleAbsenceTypes"
         try:
-            eligible_data = get_workday_data_merged(base_url, tenant, access_token, [eligible_types_endpoint])
+            eligible_data = get_workday_data_merged(access_token, [eligible_types_endpoint])
             user_data['eligible_absence_types'] = eligible_data
         except ValueError:
             pass
@@ -366,7 +414,7 @@ def get_valid_time_off_dates(base_url: str, tenant: str, access_token: str, work
     date_params = "&".join([f"date={date}" for date in dates])
     endpoint = f"{base_url}/api/absenceManagement/v3/{tenant}/workers/{workday_id}/validTimeOffDates?timeOff={time_off_type_id}&{date_params}"
     
-    return get_workday_data_merged(base_url, tenant, access_token, [endpoint])
+    return get_workday_data_merged(access_token, [endpoint])
 
 
 def submit_time_off_request(base_url: str, tenant: str, access_token: str, workday_id: str, 

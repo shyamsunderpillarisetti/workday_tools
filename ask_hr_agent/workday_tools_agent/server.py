@@ -1,12 +1,24 @@
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from .tls import configure_tls
+
+
+class _GenaiNonTextWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "non-text parts in the response" not in record.getMessage()
+
+configure_tls()
+logging.getLogger("google.genai.types").addFilter(_GenaiNonTextWarningFilter())
 
 from .agent import chat_with_workday, get_workday_id, reset_auth_cache
 from .doc_generator import (
@@ -19,6 +31,15 @@ BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app = FastAPI()
+
+# Allow cross-origin calls from the frontend (dev: allow all; lock down in prod)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if str(os.getenv("ASKHR_RESET_AUTH_ON_STARTUP", "true")).lower() in ("1", "true", "yes"):
     reset_auth_cache()
@@ -61,7 +82,7 @@ async def chat(request: Request) -> Dict[str, Any]:
         )
 
     try:
-        response = chat_with_workday(message)
+        response = await chat_with_workday(message)
         return {"response": response}
     except ValueError as e:
         raise HTTPException(
@@ -125,14 +146,14 @@ async def download_doc_from_memory(doc_key: str):
 
 
 @app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+async def http_exception_handler(_request: Request, exc: StarletteHTTPException):
     if exc.status_code == status.HTTP_404_NOT_FOUND:
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"error": "Not found"})
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+async def validation_exception_handler(_request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={"error": "Invalid request", "detail": exc.errors()},
@@ -140,7 +161,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 @app.exception_handler(Exception)
-async def internal_error_handler(request: Request, exc: Exception):
+async def internal_error_handler(_request: Request, _exc: Exception):
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"error": "Internal server error"},

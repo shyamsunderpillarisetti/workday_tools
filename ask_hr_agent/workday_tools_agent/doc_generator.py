@@ -1,11 +1,10 @@
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from io import BytesIO
 
 import warnings
-from docx import Document
 from jinja2 import Environment, StrictUndefined
 try:
     # Silence docxcompose/pkg_resources deprecation noise during import
@@ -62,72 +61,6 @@ def _sanitize_filename(name: str, preserve_spaces: bool = False) -> str:
     if not preserve_spaces:
         safe = safe.replace(" ", "_")
     return safe or f"document_{int(datetime.now().timestamp())}"
-
-
-def generate_docx(title: str, content: str, filename: Optional[str] = None) -> Dict[str, str]:
-    """Generate a simple DOCX document and return file metadata.
-
-    Args:
-        title: Document title (adds a heading)
-        content: Main body text content
-        filename: Optional desired filename (without path). If not provided, auto-generates.
-
-    Returns:
-        Dict with keys: success, filename, download_key
-    """
-    title = (title or "Document").strip()
-    content = (content or "").strip()
-
-    base_name = _sanitize_filename(filename or f"{title.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx")
-    if not base_name.lower().endswith(".docx"):
-        base_name += ".docx"
-
-    doc = Document()
-    doc.add_heading(title, level=1)
-    if content:
-        for line in content.splitlines():
-            doc.add_paragraph(line)
-    
-    # Save to BytesIO instead of disk
-    output = BytesIO()
-    doc.save(output)
-    output.seek(0)
-    
-    # Store in cache with unique key
-    doc_key = f"{datetime.now().timestamp()}_{base_name}"
-    _document_cache[doc_key] = {"bytes": output, "filename": base_name}
-
-    return {
-        "success": True,
-        "filename": base_name,
-        "download_key": doc_key,
-    }
-
-
-def list_templates() -> List[str]:
-    """List available .docx templates in the templates folder."""
-    return sorted([p.name for p in TEMPLATES_DIR.glob("*.docx")])
-
-
-def get_template_placeholders(template_name: str) -> List[str]:
-    """Return a sorted list of placeholder variables used in the template.
-
-    Tries docxtpl first; if parsing fails, falls back to regex scanning.
-    """
-    tpl_path = TEMPLATES_DIR / template_name
-    if not tpl_path.exists():
-        raise FileNotFoundError(f"Template not found: {template_name}")
-
-    if _HAS_DOXCTPL:
-        try:
-            tpl = DocxTemplate(str(tpl_path))
-            vars_set = tpl.get_undeclared_template_variables()
-            return sorted(list(vars_set))
-        except Exception:
-            pass
-
-    doc = Document(str(tpl_path))
-    return _regex_scan_placeholders(doc)
 
 
 def generate_docx_from_template(template_name: str, context: Dict[str, Any], filename: Optional[str] = None) -> Dict[str, Any]:
@@ -303,7 +236,3 @@ def get_document_mimetype_from_cache(doc_key: str) -> str:
         return "application/pdf"
     return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-
-def clear_document_cache(doc_key: str):
-    """Remove a document from memory cache."""
-    _document_cache.pop(doc_key, None)

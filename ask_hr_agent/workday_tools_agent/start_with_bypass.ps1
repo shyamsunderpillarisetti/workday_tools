@@ -17,10 +17,19 @@ $env:ASKHR_DISABLE_SSL_VERIFY = "true"
 $env:ASKHR_BROWSER = $Browser
 $env:ASKHR_HEADLESS = $(if ($Headless) { "true" } else { "false" })
 
-# Prepend cached Edge driver if present (adjust path if you use Chrome)
-$edgeDriver = Join-Path $env:USERPROFILE ".cache\selenium\msedgedriver\win64\143.0.3650.80"
-if (Test-Path $edgeDriver) {
-    $env:PATH = "$edgeDriver;$env:PATH"
+# Prefer repo drivers if present
+$driversDir = Join-Path $root "drivers"
+$edgeDriver = Join-Path $driversDir "msedgedriver.exe"
+$chromeDriver = Join-Path $driversDir "chromedriver.exe"
+if (Test-Path $edgeDriver) { $env:ASKHR_EDGEDRIVER_PATH = $edgeDriver }
+if (Test-Path $chromeDriver) { $env:ASKHR_CHROMEDRIVER_PATH = $chromeDriver }
+
+# Fallback to cached Edge driver if present
+if (-not (Test-Path $edgeDriver)) {
+    $edgeCache = Join-Path $env:USERPROFILE ".cache\selenium\msedgedriver\win64\143.0.3650.80"
+    if (Test-Path $edgeCache) {
+        $env:PATH = "$edgeCache;$env:PATH"
+    }
 }
 
 Write-Host "Starting AskHR Workday tools server with TLS bypass enabled on port $Port (browser=$Browser, headless=$($Headless.IsPresent))"

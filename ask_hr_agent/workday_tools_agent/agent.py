@@ -2,6 +2,8 @@ import json
 import os
 import re
 import time
+import uuid
+from urllib.parse import quote
 from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -11,7 +13,6 @@ from typing import Dict, Any, Optional
 if os.getenv("ASKHR_DISABLE_SSL_VERIFY", "false").lower() in ("1", "true", "yes"):
     import ssl
     import urllib3
-    import httpx
     from httpx._transports.default import HTTPTransport
 
     _ssl_ctx = ssl.create_default_context()
@@ -32,14 +33,14 @@ if os.getenv("ASKHR_DISABLE_SSL_VERIFY", "false").lower() in ("1", "true", "yes"
 
     HTTPTransport.__init__ = _patched_httpx_init  # type: ignore
 
-from google import genai
+from google.adk.agents import LlmAgent
+from google.adk.models import Gemini
+from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from .workday_api import complete_oauth_flow, get_valid_time_off_dates, submit_time_off_request
 from .doc_generator import (
-    generate_docx_from_template,
     generate_docx_from_template_as_pdf,
-    get_document_from_cache,
 )
 
 CONFIG_PATH = str(Path(__file__).parent / "config.json")
@@ -70,6 +71,15 @@ def _load_env_from_file() -> None:
         pass
 
 _load_env_from_file()
+
+
+def _build_download_url(doc_key: str) -> str:
+    base_url = os.getenv("WORKDAY_TOOLS_PUBLIC_URL") or os.getenv("WORKDAY_TOOLS_URL") or ""
+    safe_key = quote(doc_key)
+    path = f"/download_doc/{safe_key}"
+    if base_url:
+        return f"{base_url.rstrip('/')}{path}"
+    return path
 
 
 @lru_cache(maxsize=1)
@@ -110,16 +120,16 @@ def _get_workday_data() -> Dict[str, Any]:
 
 def reset_auth_cache() -> bool:
     """Clear cached OAuth token and in-memory cache to force re-auth on next call."""
-    global _user_context, _chat_history, _submission_complete, _evl_sent_to_hr
+    global _user_context, _submission_complete, _evl_sent_to_hr, _runner, _session_id
     try:
         try:
             _get_cached_workday_data.cache_clear()
         except Exception:
             pass
         _user_context = None
-        _chat_history = []
         _submission_complete = False
         _evl_sent_to_hr = False
+        _reset_session()
         if TOKEN_CACHE_PATH.exists():
             TOKEN_CACHE_PATH.unlink()
             print('[OK] Token cache cleared (.token_cache.json deleted)')
@@ -134,7 +144,7 @@ def reset_auth_cache() -> bool:
                 print('[OK] EVL sent flag cleared')
             except Exception:
                 pass
-        print('[OK] Session state reset (context + history cleared)')
+        print('[OK] Session state reset (context + session cleared)')
         return True
     except Exception as e:
         print(f'[ERROR] Failed to reset auth cache: {e}')
@@ -207,7 +217,7 @@ def _resolve_time_off_type_id(identifier: str) -> str:
         if not resolved_id or not re.fullmatch(r"[0-9a-fA-F]{32}", resolved_id):
             raise ValueError(f"Resolved ID for '{identifier}' is invalid")
         return resolved_id.lower()
-    except Exception as e:
+    except Exception:
         raise
 
 
@@ -399,7 +409,15 @@ def check_valid_dates_tool(time_off_type_id: str, dates: list[str]) -> str:
 def submit_time_off_tool(time_off_type_id: str, start_date: str, end_date: str, 
                          hours_per_day: float, comment: Optional[str] = None) -> str:
     """Submit a time off request. Only call after user confirms."""
-    return submit_time_off(time_off_type_id, start_date, end_date, hours_per_day, comment)
+    global _submission_complete
+    result = submit_time_off(time_off_type_id, start_date, end_date, hours_per_day, comment)
+    try:
+        payload = json.loads(result) if isinstance(result, str) else {}
+        if isinstance(payload, dict) and payload.get("success") is True:
+            _submission_complete = True
+    except Exception:
+        pass
+    return result
 
 
 def get_tenure_tool() -> str:
@@ -423,7 +441,7 @@ def generate_employment_verification_letter_tool() -> str:
         )
         filename = result.get("filename")
         doc_key = result.get("download_key")
-        download_url = f"/download_doc/{doc_key}"
+        download_url = _build_download_url(doc_key)
         message = f"Your employment verification letter has been generated. [Download here]({download_url})"
         _evl_sent_to_hr = True
         try:
@@ -533,11 +551,14 @@ def get_template_context(overrides: Optional[Dict[str, Any]] = None) -> Dict[str
         return overrides or {}
 
 
-# Configure Google GenAI client with API key
-_api_key = os.getenv("GOOGLE_API_KEY")
-if not _api_key:
-    raise ValueError("GOOGLE_API_KEY is not set. Add it to .env or environment.")
-client = genai.Client(api_key=_api_key)
+def _using_vertex() -> bool:
+    return os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in ("1", "true", "yes")
+
+
+if not _using_vertex():
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set. Add it to .env or environment.")
 
 SYSTEM_INSTRUCTION = """You are AskHR AI, an HR assistant powered by Workday. You have access to the user's HR data and can answer questions about their profile, leave balances, time-off requests, and document generation. Respond naturally and helpfully using the information you have.
 
@@ -585,10 +606,58 @@ CRITICAL - Time-Off Submission Rules (MANDATORY):
 
 Never reject user modifications. Always accept modifications, show updated summary, and ask for fresh confirmation."""
 
-_chat_history = []
+_runner: Optional[InMemoryRunner] = None
+_session_id = str(uuid.uuid4())
 _user_context = None
 _submission_complete = False
 _evl_sent_to_hr = EVL_SENT_FLAG_PATH.exists()
+
+
+def _build_agent() -> LlmAgent:
+    model_name = os.getenv("ASKHR_WORKDAY_MODEL", "gemini-2.5-pro")
+    return LlmAgent(
+        name="workday_tools_agent",
+        model=Gemini(model=model_name),
+        instruction=SYSTEM_INSTRUCTION,
+        tools=tools,
+        generate_content_config=types.GenerateContentConfig(temperature=0.7),
+    )
+
+
+def _get_runner() -> InMemoryRunner:
+    global _runner
+    if _runner is None:
+        _runner = InMemoryRunner(_build_agent(), app_name="workday_tools_agent")
+    return _runner
+
+
+def _reset_session() -> None:
+    global _runner, _session_id
+    _runner = None
+    _session_id = str(uuid.uuid4())
+
+async def _ensure_session(runner: InMemoryRunner, user_id: str, session_id: str) -> None:
+    session_service = runner.session_service
+    app_name = runner.app_name
+    session = await session_service.get_session(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if session is None:
+        await session_service.create_session(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+
+def _extract_text(content: Optional[types.Content]) -> str:
+    if not content or not content.parts:
+        return ""
+    return "".join(
+        part.text for part in content.parts if part.text and not getattr(part, "thought", False)
+    )
 
 
 def get_user_context() -> str:
@@ -623,10 +692,10 @@ AVAILABLE TIME-OFF TYPES:
         return f"[Error fetching context: {str(e)}]"
 
 
-def chat_with_workday(user_message: str) -> str:
-    """Send a message to the agent with user context"""
-    global _chat_history, _submission_complete, _evl_sent_to_hr
-    
+async def chat_with_workday(user_message: str) -> str:
+    """Send a message to the agent with user context."""
+    global _submission_complete, _evl_sent_to_hr
+
     try:
         # Fast-path EVL requests to guarantee a download link instead of relying on the model
         def _maybe_handle_evl(msg: str) -> Optional[str]:
@@ -681,96 +750,38 @@ def chat_with_workday(user_message: str) -> str:
         if evl_response:
             return evl_response
 
-        # Reset chat history if previous submission completed
+        # Reset session after a completed submission to avoid repeated actions.
         if _submission_complete:
-            _chat_history = []
+            _reset_session()
             _submission_complete = False
-        
+
         context = get_user_context()
         today_str = date.today().isoformat()
         full_message = f"{context}\n\nTODAY: {today_str}\n\nUSER MESSAGE: {user_message}"
-        _chat_history.append(full_message)
-        
-        while True:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash-exp",
-                contents=_chat_history,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    tools=tools,
-                    temperature=0.7
-                )
-            )
-            
-            if hasattr(response, 'text') and response.text:
-                _chat_history.append(response.text)
-                return response.text
-            
-            if hasattr(response, 'candidates') and len(response.candidates) > 0:
-                candidate = response.candidates[0]
-                
-                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                    text_parts = []
-                    tool_calls = []
-                    
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_parts.append(part.text)
-                        elif hasattr(part, 'function_call'):
-                            tool_calls.append(part.function_call)
-                    
-                    if text_parts:
-                        result = ''.join(text_parts)
-                        _chat_history.append(result)
-                        return result
-                    
-                    if tool_calls:
-                        _chat_history.append(candidate.content)
-                        
-                        for tool_call in tool_calls:
-                            tool_name = tool_call.name
-                            tool_args = tool_call.args
-                            
-                            if tool_name == 'get_workday_id_tool':
-                                result = get_workday_id_tool()
-                            elif tool_name == 'check_valid_dates_tool':
-                                result = check_valid_dates_tool(
-                                    tool_args.get('time_off_type_id'),
-                                    tool_args.get('dates', [])
-                                )
-                            elif tool_name == 'submit_time_off_tool':
-                                result = submit_time_off_tool(
-                                    tool_args.get('time_off_type_id'),
-                                    tool_args.get('start_date'),
-                                    tool_args.get('end_date'),
-                                    tool_args.get('hours_per_day'),
-                                    tool_args.get('comment')
-                                )
-                                _submission_complete = True
-                            else:
-                                result = json.dumps({"error": f"Unknown tool: {tool_name}"})
-                            
-                            if isinstance(result, str):
-                                try:
-                                    result_data = json.loads(result)
-                                except json.JSONDecodeError:
-                                    result_data = {"result": result}
-                            else:
-                                result_data = result
-                            
-                            _chat_history.append({
-                                "role": "user",
-                                "parts": [{
-                                    "function_response": {
-                                        "name": tool_name,
-                                        "response": result_data
-                                    }
-                                }]
-                            })
-                        continue
-            
+
+        runner = _get_runner()
+        await _ensure_session(runner, "workday_user", _session_id)
+        content = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=full_message)],
+        )
+
+        reply_text = ""
+        async for event in runner.run_async(
+            user_id="workday_user",
+            session_id=_session_id,
+            new_message=content,
+        ):
+            if event.is_final_response():
+                reply_text = _extract_text(event.content) or reply_text
+                if event.error_message:
+                    reply_text = event.error_message
+
+        if not reply_text:
             return "I apologize, but I couldn't process that request. Please try again."
-            
+
+        return reply_text
+
     except Exception as e:
         error_str = str(e).lower()
         if '429' in error_str or 'resource exhausted' in error_str or 'quota' in error_str:
